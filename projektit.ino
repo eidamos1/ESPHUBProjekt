@@ -18,22 +18,24 @@ Preferences preferences;
 WebServer server(80);
 static WireGuard wg;
 
-/* === NASTAVENÍ WIREGUARD VPN A DOMÁCÍHO UBUNTU SERVERU === */
-const char* WG_PRIVATE_KEY   = "qNZFRaBrvMINCKnfXp+FC8XJ7sDdM3B5QeS8uTb2Nk8=";
-const char* WG_PUBLIC_KEY    = "Mu6vj1ADSXER7vziNUM5pZ+yQPkBof8Z7XF2a7c62Hg=";
+/* === 1. NASTAVENÍ WI-FI, WIREGUARD VPN A DOMÁCÍHO SERVERU === */
+// Volitelné: Pokud sem napíšeš svou Wi-Fi, ESP32 se připojí hned po zapnutí:
+const char* DEFAULT_WIFI_SSID = ""; 
+const char* DEFAULT_WIFI_PASS = ""; 
 
-// Veřejná (nebo cílová) IP adresa pro WireGuard UDP tunel (port 51820):
-const char* WG_ENDPOINT_ADDR = "31.30.46.15"; 
+// Klíče vygenerované příkazem `wg genkey` na Ubuntu:
+const char* WG_PRIVATE_KEY    = "SEM_VLOZ_ESP32_PRIVATE_KEY";
+const char* WG_PUBLIC_KEY     = "SEM_VLOZ_SERVER_PUBLIC_KEY";
+// IP adresa tvého Ubuntu serveru (doma lokální IP např. "192.168.1.50", venku veřejná IP):
+const char* WG_ENDPOINT_ADDR  = "192.168.1.100"; 
 const uint16_t WG_ENDPOINT_PORT = 51820;
 const IPAddress WG_LOCAL_IP(10, 8, 0, 50);
 
-// 1. Primární IP Ubuntu serveru uvnitř WireGuard tunelu:
-const char* HOME_SERVER_VPN_HOST = "10.8.0.1"; 
-// 2. Lokální LAN IP tvého Ubuntu serveru doma (fallback pokud neběží VPN):
-const char* HOME_SERVER_LAN_HOST = "192.168.1.100"; 
-const uint16_t HOME_SERVER_PORT  = 8085;
+// IP adresa Ubuntu serveru uvnitř VPN tunelu (má automatický fallback na WG_ENDPOINT_ADDR):
+const char* HOME_SERVER_HOST  = "10.8.0.1"; 
+const uint16_t HOME_SERVER_PORT = 8085;
 
-/* === 1. DATOVÉ STRUKTURY A STAVOVÝ AUTOMAT APLIKACÍ === */
+/* === 2. DATOVÉ STRUKTURY A STAVOVÝ AUTOMAT APLIKACÍ === */
 enum AppID : uint8_t {
     APP_LAUNCHER = 0,
     APP_RADAR    = 1,
@@ -104,14 +106,14 @@ struct PulseEcho {
 
 enum ParserState { HEAD1, HEAD2, HEAD3, HEAD4, DATA, TAIL1, TAIL2 };
 
-/* === 2. DYNAMICKÉ UKAZATELE NA HEAPU === */
+/* === 3. DYNAMICKÉ UKAZATELE NA HEAPU === */
 StrokeSegment* strokeHistory = NULL; 
 StrokeSegment* webDrawQ      = NULL; 
 float*         zBuffer       = NULL; 
 PulseEcho*     echos         = NULL; 
 char*          jsonBuf       = NULL; 
 
-/* === 3. MEZIJADERNÁ KOMUNIKACE (Jádro 0 <-> Jádro 1) === */
+/* === 4. MEZIJADERNÁ KOMUNIKACE (Jádro 0 <-> Jádro 1) === */
 char current_ssid[64] = "";
 char current_pass[64] = "";
 char scan_options_buf[384] = "Hledam site...\nProsim cekejte";
@@ -122,8 +124,8 @@ volatile bool status_bar_dirty = true;
 volatile bool wifi_connect_request = false; 
 volatile bool wifi_scan_request = false;    
 volatile bool wifi_scan_ready = false;      
-char wifi_ip_str[48] = "Wi-Fi: OFF";
-char local_ip_only[24] = "0.0.0.0";
+char wifi_ip_str[36] = "Wi-Fi: OFF";
+char lan_status_detail[64] = "Wi-Fi nepripojeno (Otevri Wi-Fi)";
 
 volatile int remote_cmd = 0;
 volatile int web_doom_action = 0;
@@ -136,7 +138,7 @@ char remote_toast_text[64] = "";
 volatile bool remote_toast_pending = false;
 unsigned long toast_hide_time = 0;
 
-/* === 4. SMART HOME & LOKÁLNÍ AI PROMĚNNÉ === */
+/* === 5. SMART HOME & LOKÁLNÍ AI PROMĚNNÉ === */
 const int RELAY_COUNT = 4;
 const char* relayNames[RELAY_COUNT] = {"Hlavni Svetlo", "LED Pasek", "3D Tiskarna", "Ventilator"};
 volatile bool relayStates[RELAY_COUNT] = {false, false, false, false};
@@ -149,7 +151,7 @@ volatile bool ai_request_pending = false;
 volatile bool ai_response_dirty = false;
 volatile bool ai_is_streaming = false;
 
-/* === 5. HARDWARE A OVLADAČE === */
+/* === 6. HARDWARE A OVLADAČE === */
 #define RADAR_RX 2 
 #define RADAR_TX 4 
 const long RADAR_BAUD_RATE = 256000; 
@@ -165,7 +167,7 @@ static lv_color_t buf[ screenWidth * screenHeight / 12 ];
 /* === UI PROMĚNNÉ === */
 lv_obj_t * current_screen = NULL;
 lv_obj_t * wifi_icon = NULL; 
-lv_obj_t * launcher_ip_banner = NULL;
+lv_obj_t * launcher_ip_label = NULL;
 lv_obj_t * toast_box = NULL;
 lv_obj_t * toast_label = NULL;
 lv_obj_t * btn_mode_label = NULL;
@@ -309,23 +311,7 @@ void setRadarHardwareTrackingMode(bool multiTarget) {
     radar_multi_mode = multiTarget;
 }
 
-/* === KOMUNIKACE S DOMÁCÍM SERVEREM (VPN -> LAN FALLBACK -> WAN FALLBACK) === */
-int buildCandidateHosts(const char* outHosts[3]) {
-    int count = 0;
-    if (wg_connected && strlen(HOME_SERVER_VPN_HOST) > 0) {
-        outHosts[count++] = HOME_SERVER_VPN_HOST;
-    }
-    if (strlen(HOME_SERVER_LAN_HOST) > 0 && strcmp(HOME_SERVER_LAN_HOST, HOME_SERVER_VPN_HOST) != 0) {
-        outHosts[count++] = HOME_SERVER_LAN_HOST;
-    }
-    if (strlen(WG_ENDPOINT_ADDR) > 0 &&
-        strcmp(WG_ENDPOINT_ADDR, HOME_SERVER_VPN_HOST) != 0 &&
-        strcmp(WG_ENDPOINT_ADDR, HOME_SERVER_LAN_HOST) != 0) {
-        outHosts[count++] = WG_ENDPOINT_ADDR;
-    }
-    return count;
-}
-
+/* === KOMUNIKACE S DOMÁCÍM SERVEREM (CHYTRÉ SMĚROVÁNÍ VPN / LAN + HTTP/1.0 STREAM) === */
 void parseRelaysJson(const String& body) {
     int idx = body.indexOf("[");
     if (idx >= 0 && body.length() >= (unsigned int)(idx + 7)) {
@@ -338,20 +324,25 @@ void parseRelaysJson(const String& body) {
     }
 }
 
-bool tryHttpGetWithFallback(const String& path, String& outBody, int timeoutMs = 600) {
+bool tryHttpGetWithFallback(const String& path, String& outBody, int timeoutMs = 550) {
     if (!wifi_connected) return false;
-    const char* hosts[3];
-    int hostCount = buildCandidateHosts(hosts);
+    const char* hosts[2];
+    int hostCount = 0;
+    if (wg_connected) {
+        hosts[hostCount++] = HOME_SERVER_HOST;
+    }
+    if (strcmp(WG_ENDPOINT_ADDR, HOME_SERVER_HOST) != 0) {
+        hosts[hostCount++] = WG_ENDPOINT_ADDR;
+    }
 
     for (int h = 0; h < hostCount; h++) {
         server.handleClient();
-        WiFiClient client;
         HTTPClient http;
         http.useHTTP10(true);
         String url = "http://" + String(hosts[h]) + ":" + String(HOME_SERVER_PORT) + path;
         http.setConnectTimeout(timeoutMs);
         http.setTimeout(timeoutMs);
-        if (http.begin(client, url)) {
+        if (http.begin(url)) {
             int code = http.GET();
             if (code == HTTP_CODE_OK) {
                 outBody = http.getString();
@@ -366,7 +357,7 @@ bool tryHttpGetWithFallback(const String& path, String& outBody, int timeoutMs =
 
 void syncRelaysFromServerOnCore0() {
     String body;
-    if (tryHttpGetWithFallback("/api/relays", body, 550)) {
+    if (tryHttpGetWithFallback("/api/relays", body, 500)) {
         parseRelaysJson(body);
     }
 }
@@ -376,7 +367,7 @@ void executeSmartHomeRelayOnCore0(int relayIdx) {
     bool newState = !relayStates[relayIdx];
     String body;
     String path = "/api/relay?id=" + String(relayIdx) + "&state=" + String(newState ? 1 : 0);
-    if (tryHttpGetWithFallback(path, body, 650)) {
+    if (tryHttpGetWithFallback(path, body, 600)) {
         parseRelaysJson(body);
         return;
     }
@@ -395,19 +386,24 @@ void executeAIStreamOnCore0() {
         sanitizeJsonString(cleanPrompt, ai_prompt_buf, sizeof(cleanPrompt));
         String payload = "{\"prompt\":\"" + String(cleanPrompt) + "\"}";
 
-        const char* hosts[3];
-        int hostCount = buildCandidateHosts(hosts);
+        const char* hosts[2];
+        int hostCount = 0;
+        if (wg_connected) {
+            hosts[hostCount++] = HOME_SERVER_HOST;
+        }
+        if (strcmp(WG_ENDPOINT_ADDR, HOME_SERVER_HOST) != 0) {
+            hosts[hostCount++] = WG_ENDPOINT_ADDR;
+        }
 
         for (int h = 0; h < hostCount && !connectedToHomeServer; h++) {
             server.handleClient();
-            WiFiClient client;
             HTTPClient http;
             http.useHTTP10(true);
             String url = "http://" + String(hosts[h]) + ":" + String(HOME_SERVER_PORT) + "/api/ai";
             http.setConnectTimeout(1200);
             http.setTimeout(15000);
 
-            if (http.begin(client, url)) {
+            if (http.begin(url)) {
                 http.addHeader("Content-Type", "application/json");
                 int httpCode = http.POST(payload);
                 if (httpCode == HTTP_CODE_OK) {
@@ -457,12 +453,12 @@ void executeAIStreamOnCore0() {
             relayStates[0] = false; relay_ui_dirty = true;
         }
 
-        char simReply[420];
+        char simReply[360];
         snprintf(simReply, sizeof(simReply),
-            "Ty: %s\nAI [Offline Rezime - Server %s / %s:%u nedostupny]: "
-            "Zkontroluj, zda na Ubuntu bezi gateway.py a zda mas spravnou IP serveru. "
+            "Ty: %s\nAI [Offline Demo - Server %s:%u nedostupny]: "
+            "Zkontroluj, zda na Ubuntu bezi gateway.py a zda mas v WG_ENDPOINT_ADDR spravnou IP Ubuntu serveru. "
             "Hlavni svetlo je %s.",
-            ai_prompt_buf, HOME_SERVER_VPN_HOST, HOME_SERVER_LAN_HOST, HOME_SERVER_PORT,
+            ai_prompt_buf, WG_ENDPOINT_ADDR, HOME_SERVER_PORT,
             relayStates[0] ? "ZAPNUTO" : "VYPNUTO"
         );
 
@@ -521,7 +517,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="brand">ESP32 SMART HUB // WIREGUARD &amp; AI OS</div>
     <div class="sys">
       <span>Aktivni: <b id="s_app" style="color:#00ff88">MENU</b></span>
-      <span>LAN IP: <b id="s_ip" style="color:#38bdf8">--</b></span>
       <span>VPN: <b id="s_vpn">OFF</b></span>
       <span>Radar: <b id="s_hz">0 Hz</b></span>
       <span>RAM: <b id="s_ram">-- KB</b></span>
@@ -753,7 +748,6 @@ async function poll() {
     const d = await r.json();
 
     document.getElementById('s_app').innerText = appNames[d.app] || 'MENU';
-    document.getElementById('s_ip').innerText = d.ip || window.location.hostname;
     document.getElementById('s_vpn').innerText = d.wg ? '10.8.0.50 (TUNEL OK)' : 'LAN REZIM';
     document.getElementById('s_vpn').style.color = d.wg ? '#00ff88' : '#ffaa00';
     document.getElementById('s_hz').innerText = d.hz + ' Hz';
@@ -831,12 +825,11 @@ void setupWebServer() {
 
         int pos = 0;
         pos += snprintf(jsonBuf + pos, 2560 - pos,
-            "{\"app\":%d,\"ip\":\"%s\",\"wg\":%d,\"pm\":%d,\"hm\":%d,\"rm\":%d,\"col\":%d,\"lk\":%d,\"aim\":%d,"
+            "{\"app\":%d,\"wg\":%d,\"pm\":%d,\"hm\":%d,\"rm\":%d,\"col\":%d,\"lk\":%d,\"aim\":%d,"
             "\"px\":%.2f,\"py\":%.2f,\"pa\":%.2f,\"pr\":%d,"
             "\"ram\":%u,\"rssi\":%d,\"up\":%lu,\"hz\":%d,"
             "\"cid\":%u,\"sid\":%u,\"rel\":[%d,%d,%d,%d],\"mp\":\"%s\",\"ai\":\"%s\",\"t\":[",
             (int)activeApp,
-            local_ip_only,
             wg_connected ? 1 : 0,
             radar_pulse_mode ? 1 : 0,
             radar_multi_mode ? 1 : 0,
@@ -975,44 +968,21 @@ void setupWebServer() {
     server.begin();
 }
 
-/* === BEZPEČNÁ OBSLUHA WIREGUARDU A DUAL-STACK ROUTOVÁNÍ === */
-struct netif* findNetifByIp(uint32_t target_ip_u32) {
-    if (target_ip_u32 == 0) return NULL;
-    for (struct netif* n = netif_list; n != NULL; n = n->next) {
-        if (ip4_addr_get_u32(netif_ip4_addr(n)) == target_ip_u32) {
-            return n;
-        }
-    }
-    return NULL;
-}
-
-void restoreWifiAsDefaultNetif() {
-    uint32_t sta_ip = (uint32_t)WiFi.localIP();
-    uint32_t wg_ip  = (uint32_t)WG_LOCAL_IP;
-
-    #ifdef LOCK_TCPIP_CORE
-    LOCK_TCPIP_CORE();
-    #endif
-    struct netif* wifi_netif = findNetifByIp(sta_ip);
-    struct netif* wg_netif   = findNetifByIp(wg_ip);
-
-    if (wg_netif != NULL) {
-        ip4_addr_t wg_mask;
-        IP4_ADDR(&wg_mask, 255, 255, 255, 0);
-        netif_set_netmask(wg_netif, &wg_mask);
-    }
-    if (wifi_netif != NULL) {
-        netif_set_default(wifi_netif);
-    }
-    #ifdef UNLOCK_TCPIP_CORE
-    UNLOCK_TCPIP_CORE();
-    #endif
-}
+/* === BEZPEČNÁ OBSLUHA WIREGUARDU (NEKRADE DEFAULT ROUTE PRO MOBIL NA WI-FI!) === */
+static struct netif* saved_wifi_netif = NULL;
 
 void stopWireGuardSafely() {
     if (wg_connected && wg.is_initialized()) {
+        #ifdef LOCK_TCPIP_CORE
+        LOCK_TCPIP_CORE();
+        #endif
         wg.end();
-        restoreWifiAsDefaultNetif();
+        if (saved_wifi_netif != NULL) {
+            netif_set_default(saved_wifi_netif);
+        }
+        #ifdef UNLOCK_TCPIP_CORE
+        UNLOCK_TCPIP_CORE();
+        #endif
     }
     wg_connected = false;
 }
@@ -1027,36 +997,43 @@ bool isWireGuardKeyConfigured() {
 void activateWireGuardNonBlocking() {
     if (!isWireGuardKeyConfigured() || wg.is_initialized()) return;
 
-    // POZOR: wg.begin() NESMÍ být uvnitř LOCK_TCPIP_CORE(), jinak způsobí deadlock Jádra 0!
-    bool ok = wg.begin(WG_LOCAL_IP, WG_PRIVATE_KEY, WG_ENDPOINT_ADDR, WG_PUBLIC_KEY, WG_ENDPOINT_PORT);
+    #ifdef LOCK_TCPIP_CORE
+    LOCK_TCPIP_CORE();
+    #endif
+    saved_wifi_netif = netif_default;
 
-    // Ihned po nahození tunelu nastavíme masku /24 pro 10.8.0.x a vrátíme Wi-Fi jako výchozí rozhraní!
-    restoreWifiAsDefaultNetif();
+    wg.begin(WG_LOCAL_IP, WG_PRIVATE_KEY, WG_ENDPOINT_ADDR, WG_PUBLIC_KEY, WG_ENDPOINT_PORT);
 
-    if (ok || wg.is_initialized()) {
-        wg_connected = true;
-        snprintf(wifi_ip_str, sizeof(wifi_ip_str), "%s | WG", local_ip_only);
-        Serial.printf("[WG] Tunel aktivovan (10.8.0.50 -> %s:%u), LAN IP: %s\n",
-                      WG_ENDPOINT_ADDR, WG_ENDPOINT_PORT, local_ip_only);
-    } else {
-        wg_connected = false;
-        snprintf(wifi_ip_str, sizeof(wifi_ip_str), "IP: %s", local_ip_only);
+    struct netif* wg_netif = netif_default;
+    if (wg_netif != NULL && wg_netif != saved_wifi_netif) {
+        ip4_addr_t wg_mask;
+        IP4_ADDR(&wg_mask, 255, 255, 255, 0);
+        netif_set_netmask(wg_netif, &wg_mask);
+        if (saved_wifi_netif != NULL) {
+            netif_set_default(saved_wifi_netif);
+        }
     }
+    #ifdef UNLOCK_TCPIP_CORE
+    UNLOCK_TCPIP_CORE();
+    #endif
+
+    wg_connected = true;
+    String ipStr = WiFi.localIP().toString();
+    snprintf(wifi_ip_str, sizeof(wifi_ip_str), "%s | WG", ipStr.c_str());
+    snprintf(lan_status_detail, sizeof(lan_status_detail), "LAN IP: %s | VPN: 10.8.0.50", ipStr.c_str());
     status_bar_dirty = true;
 }
 
 /* === FREERTOS TASK PRO SÍŤ, WIREGUARD, AI STREAMING A SMART HOME (Jádro 0) === */
 void networkTask(void * pvParameters) {
     unsigned long last_connect_attempt = 0;
-    const unsigned long CONNECT_TIMEOUT = 10000; 
+    const unsigned long CONNECT_TIMEOUT = 12000; 
     bool scanning_in_progress = false;
     bool server_started = false;
     bool wg_waiting_for_ntp = false;
     bool initial_relay_sync_done = false;
-    unsigned long last_relay_poll_ms = 0;
+    unsigned long ntp_start_ms = 0;
     
-    WiFi.mode(WIFI_STA);
-
     while (true) {
         if (wifi_connected && server_started) {
             server.handleClient();
@@ -1073,35 +1050,40 @@ void networkTask(void * pvParameters) {
             executeAIStreamOnCore0();
         }
 
+        // OPRAVA: Skenování Wi-Fi neshodí existující připojení, pokud už jsme připojeni!
         if (wifi_scan_request) {
             wifi_scan_request = false;
-            WiFi.scanDelete();
-            WiFi.mode(WIFI_STA);
-            // Skenujeme bez shození aktivního spojení, pokud to jde
+            if (WiFi.status() != WL_CONNECTED) {
+                WiFi.disconnect();
+                vTaskDelay(pdMS_TO_TICKS(80));
+            }
             WiFi.scanNetworks(true); 
             scanning_in_progress = true;
         }
 
         if (scanning_in_progress) {
-            int n = WiFi.scanComplete();
-            if (n >= 0) {
-                String opts = "";
-                int limit = (n > 12) ? 12 : n;
-                for (int i = 0; i < limit; ++i) {
-                    opts += WiFi.SSID(i);
-                    if (i < limit - 1) opts += "\n";
-                }
-                if (opts.length() == 0) opts = "Zadne site v okoli";
-                strncpy(scan_options_buf, opts.c_str(), sizeof(scan_options_buf) - 1);
-                scan_options_buf[sizeof(scan_options_buf) - 1] = '\0';
-                
+            if (activeApp != APP_WIFI) {
                 WiFi.scanDelete();
                 scanning_in_progress = false;
-                wifi_scan_ready = true;
-            } else if (n == WIFI_SCAN_FAILED) {
-                strncpy(scan_options_buf, "Sken selhal - zkus SKEN", sizeof(scan_options_buf) - 1);
-                scanning_in_progress = false;
-                wifi_scan_ready = true;
+            } else {
+                int n = WiFi.scanComplete();
+                if (n >= 0) {
+                    String opts = "";
+                    int limit = (n > 12) ? 12 : n;
+                    for (int i = 0; i < limit; ++i) {
+                        opts += WiFi.SSID(i);
+                        if (i < limit - 1) opts += "\n";
+                    }
+                    if (opts.length() == 0) opts = "Zadne site v okoli";
+                    strncpy(scan_options_buf, opts.c_str(), sizeof(scan_options_buf) - 1);
+                    scan_options_buf[sizeof(scan_options_buf) - 1] = '\0';
+                    
+                    WiFi.scanDelete();
+                    scanning_in_progress = false;
+                    wifi_scan_ready = true;
+                } else if (n == WIFI_SCAN_FAILED) {
+                    scanning_in_progress = false;
+                }
             }
         }
 
@@ -1110,14 +1092,15 @@ void networkTask(void * pvParameters) {
             stopWireGuardSafely();
             wg_waiting_for_ntp = false;
             wifi_connected = false;
-            snprintf(wifi_ip_str, sizeof(wifi_ip_str), "Pripojuji Wi-Fi...");
+            snprintf(wifi_ip_str, sizeof(wifi_ip_str), "Pripojuji...");
+            snprintf(lan_status_detail, sizeof(lan_status_detail), "Pripojuji k: %s...", current_ssid);
             status_bar_dirty = true;
 
-            WiFi.disconnect(false, false);
-            vTaskDelay(pdMS_TO_TICKS(80)); 
+            WiFi.disconnect();
+            vTaskDelay(pdMS_TO_TICKS(100)); 
             WiFi.mode(WIFI_STA);
             if (strlen(current_ssid) > 0) {
-                Serial.printf("[Wi-Fi] Pripojuji k SSID: %s\n", current_ssid);
+                Serial.printf("[WIFI] Pripojuji k SSID: %s\n", current_ssid);
                 WiFi.begin(current_ssid, current_pass);
                 last_connect_attempt = millis(); 
             }
@@ -1125,13 +1108,13 @@ void networkTask(void * pvParameters) {
 
         if (WiFi.status() == WL_CONNECTED) {
             if (!wifi_connected) {
-                strncpy(local_ip_only, WiFi.localIP().toString().c_str(), sizeof(local_ip_only) - 1);
-                local_ip_only[sizeof(local_ip_only) - 1] = '\0';
-                snprintf(wifi_ip_str, sizeof(wifi_ip_str), "IP: %s", local_ip_only);
+                String ipStr = WiFi.localIP().toString();
+                Serial.printf("[WIFI] PRIPOJENO! Lokalni IP adresa: http://%s\n", ipStr.c_str());
+
+                snprintf(wifi_ip_str, sizeof(wifi_ip_str), "IP: %s", ipStr.c_str());
+                snprintf(lan_status_detail, sizeof(lan_status_detail), "LAN IP: http://%s", ipStr.c_str());
                 wifi_connected = true;
                 status_bar_dirty = true;
-
-                Serial.printf("[Wi-Fi] PRIPOJENO! Lokalni IP pro mobil: http://%s\n", local_ip_only);
 
                 if (!server_started) {
                     setupWebServer();
@@ -1139,27 +1122,23 @@ void networkTask(void * pvParameters) {
                 }
 
                 if (isWireGuardKeyConfigured()) {
-                    configTime(3600, 3600, "pool.ntp.org", "time.google.com", "cz.pool.ntp.org");
+                    configTime(3600, 3600, "pool.ntp.org", "time.google.com");
                     wg_waiting_for_ntp = true;
+                    ntp_start_ms = millis();
                 }
                 initial_relay_sync_done = false;
             }
 
-            // WireGuard spouštíme VÝHRADNĚ až když je platný NTP čas (zabraňuje zablokování wg.begin)
             if (wg_waiting_for_ntp) {
                 time_t nowEpoch = time(nullptr);
-                if (nowEpoch > 1700000000) {
+                if (nowEpoch > 1700000000 || (millis() - ntp_start_ms > 3500)) {
                     wg_waiting_for_ntp = false;
                     activateWireGuardNonBlocking();
                 }
             }
 
-            if (!initial_relay_sync_done) {
+            if (!initial_relay_sync_done && !wg_waiting_for_ntp) {
                 initial_relay_sync_done = true;
-                syncRelaysFromServerOnCore0();
-                last_relay_poll_ms = millis();
-            } else if (activeApp == APP_HOME && (millis() - last_relay_poll_ms > 4000)) {
-                last_relay_poll_ms = millis();
                 syncRelaysFromServerOnCore0();
             }
 
@@ -1170,19 +1149,21 @@ void networkTask(void * pvParameters) {
                 stopWireGuardSafely();
                 wg_waiting_for_ntp = false;
                 wifi_connected = false;
-                snprintf(local_ip_only, sizeof(local_ip_only), "0.0.0.0");
                 snprintf(wifi_ip_str, sizeof(wifi_ip_str), "Wi-Fi: OFF");
+                snprintf(lan_status_detail, sizeof(lan_status_detail), "Odpojeno (Zkontroluj Wi-Fi)");
                 status_bar_dirty = true;
             }
-            if (strlen(current_ssid) > 0 && !wifi_connect_request && !scanning_in_progress && activeApp != APP_WIFI) {
+            if (strlen(current_ssid) > 0 && !wifi_connect_request && !scanning_in_progress) {
                 if (millis() - last_connect_attempt > CONNECT_TIMEOUT) {
-                    WiFi.disconnect(false, false);
-                    vTaskDelay(pdMS_TO_TICKS(80));
+                    snprintf(wifi_ip_str, sizeof(wifi_ip_str), "Pripojuji...");
+                    status_bar_dirty = true;
+                    WiFi.disconnect();
+                    vTaskDelay(pdMS_TO_TICKS(100));
                     WiFi.begin(current_ssid, current_pass);
                     last_connect_attempt = millis(); 
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(150)); 
+            vTaskDelay(pdMS_TO_TICKS(200)); 
         }
     }
 }
@@ -1240,7 +1221,7 @@ void shutdownCurrentApp() {
     doom_action = 0;
     web_doom_action = 0;
 
-    launcher_ip_banner = NULL;
+    launcher_ip_label = NULL;
     btn_mode_label = NULL;
     kb = NULL;
     dd_ssid = NULL;
@@ -1434,22 +1415,7 @@ static void doom_touch_cb(lv_event_t * e) {
     }
 }
 
-/* === APLIKACE 1: HUB LAUNCHER (6 IKON + SPODNÍ STAVOVÝ ŘÁDEK S LOKÁLNÍ IP) === */
-void updateLauncherIpBanner() {
-    if (activeApp != APP_LAUNCHER || launcher_ip_banner == NULL) return;
-    if (wifi_connected) {
-        lv_label_set_text_fmt(launcher_ip_banner, "Mobil (LAN): http://%s  |  VPN: %s",
-                              local_ip_only, wg_connected ? "10.8.0.50" : "Cekam");
-        lv_obj_set_style_text_color(launcher_ip_banner, lv_color_hex(0x38BDF8), 0);
-    } else if (strlen(current_ssid) > 0) {
-        lv_label_set_text_fmt(launcher_ip_banner, "Pripojuji k Wi-Fi: %s ...", current_ssid);
-        lv_obj_set_style_text_color(launcher_ip_banner, lv_color_hex(0xFBBF24), 0);
-    } else {
-        lv_label_set_text(launcher_ip_banner, "Wi-Fi nenastavena -> Otevri aplikaci Wi-Fi");
-        lv_obj_set_style_text_color(launcher_ip_banner, lv_color_hex(0x94A3B8), 0);
-    }
-}
-
+/* === APLIKACE 1: HUB LAUNCHER (6 IKON + DOLNÍ INFORMAČNÍ LIŠTA S IP ADRESOU) === */
 void create_launcher_screen() {
     lv_obj_set_style_bg_color(current_screen, lv_color_hex(0x12161f), 0);
     lv_obj_t * title = lv_label_create(current_screen);
@@ -1465,8 +1431,8 @@ void create_launcher_screen() {
         int col = i % 3;
         int row = i / 3;
         lv_obj_t * btn = lv_btn_create(current_screen);
-        lv_obj_set_size(btn, 96, 80);
-        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 10 + col * 102, 30 + row * 88);
+        lv_obj_set_size(btn, 96, 78);
+        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 10 + col * 102, 28 + row * 84);
         lv_obj_set_style_bg_color(btn, lv_color_hex(colors[i]), 0);
         lv_obj_add_event_cb(btn, [](lv_event_t * e) {
             AppID targetApp = (AppID)(size_t)lv_event_get_user_data(e);
@@ -1478,9 +1444,19 @@ void create_launcher_screen() {
         lv_obj_center(lbl);
     }
 
-    launcher_ip_banner = lv_label_create(current_screen);
-    lv_obj_align(launcher_ip_banner, LV_ALIGN_BOTTOM_MID, 0, -4);
-    updateLauncherIpBanner();
+    // Dolní informační panel s plnou lokální IP adresou pro mobil a stavem VPN
+    lv_obj_t * ip_bar = lv_obj_create(current_screen);
+    lv_obj_set_size(ip_bar, 304, 24);
+    lv_obj_align(ip_bar, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(ip_bar, lv_color_hex(0x090d14), 0);
+    lv_obj_set_style_border_color(ip_bar, lv_color_hex(0x2a3546), 0);
+    lv_obj_set_style_border_width(ip_bar, 1, 0);
+    lv_obj_clear_flag(ip_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    launcher_ip_label = lv_label_create(ip_bar);
+    lv_label_set_text(launcher_ip_label, lan_status_detail);
+    lv_obj_set_style_text_color(launcher_ip_label, lv_color_hex(wifi_connected ? 0x00FF88 : 0xFFAA00), 0);
+    lv_obj_center(launcher_ip_label);
 }
 
 /* === APLIKACE 5: SMART HOME OVLÁDÁNÍ RELÉ === */
@@ -1669,7 +1645,7 @@ void create_ai_screen() {
         "Shrn stav chytrych zarizeni v dome.",
         "Zapni hlavni svetlo v pokoji a potvrd to.",
         "Vypni hlavni svetlo v pokoji a potvrd to.",
-        "Rekni kratkou technickou zajimavost o mmWave radaru."
+        "Rekni kratkou technickou zajímavost o mmWave radaru."
     };
 
     for (int i = 0; i < 4; i++) {
@@ -1695,8 +1671,8 @@ void create_ai_screen() {
     lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* === APLIKACE 4: WI-FI NASTAVENÍ (S TLAČÍTKY SKEN A PŘIPOJIT) === */
-void saveAndConnectWiFiFromUI() {
+/* === APLIKACE 4: WI-FI NASTAVENÍ (S TLAČÍTKEM PRIPOJIT!) === */
+void saveAndConnectWifiFromUI() {
     if (dd_ssid == NULL || ta_pass == NULL) return;
     char selected_ssid[64] = "";
     lv_dropdown_get_selected_str(dd_ssid, selected_ssid, sizeof(selected_ssid));
@@ -1704,7 +1680,6 @@ void saveAndConnectWiFiFromUI() {
     if (strcmp(selected_ssid, "Hledam site...") != 0 && 
         strcmp(selected_ssid, "Prosim cekejte") != 0 && 
         strcmp(selected_ssid, "Zadne site v okoli") != 0 &&
-        strcmp(selected_ssid, "Sken selhal - zkus SKEN") != 0 &&
         strlen(selected_ssid) > 0) {
         
         strncpy(current_ssid, selected_ssid, sizeof(current_ssid) - 1);
@@ -1731,7 +1706,7 @@ static void ta_event_cb(lv_event_t * e) {
 static void kb_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY) { 
-        saveAndConnectWiFiFromUI();
+        saveAndConnectWifiFromUI();
     }
 }
 
@@ -1739,54 +1714,38 @@ void create_wifi_screen() {
     lv_obj_set_style_bg_color(current_screen, lv_color_hex(0x222222), 0);
 
     lv_obj_t * btn_back = lv_btn_create(current_screen);
-    lv_obj_set_size(btn_back, 56, 30);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_size(btn_back, 58, 32);
+    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 5, 5);
     lv_obj_set_style_bg_color(btn_back, lv_color_hex(0xAA0000), 0);
     lv_obj_add_event_cb(btn_back, btn_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * lbl_back = lv_label_create(btn_back);
     lv_label_set_text(lbl_back, "ZPET");
     lv_obj_center(lbl_back);
 
-    lv_obj_t * btn_scan = lv_btn_create(current_screen);
-    lv_obj_set_size(btn_scan, 56, 30);
-    lv_obj_align(btn_scan, LV_ALIGN_TOP_LEFT, 64, 4);
-    lv_obj_set_style_bg_color(btn_scan, lv_color_hex(0x2563EB), 0);
-    lv_obj_add_event_cb(btn_scan, [](lv_event_t * e) {
-        if (dd_ssid != NULL) lv_dropdown_set_options(dd_ssid, "Hledam site...\nProsim cekejte");
-        wifi_scan_ready = false;
-        wifi_scan_request = true;
-    }, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * lbl_scan = lv_label_create(btn_scan);
-    lv_label_set_text(lbl_scan, "SKEN");
-    lv_obj_center(lbl_scan);
-
+    // Zelené tlačítko PRIPOJIT (aby uživatel nemusel hledat malou fajfku na klávesnici)
     lv_obj_t * btn_conn = lv_btn_create(current_screen);
-    lv_obj_set_size(btn_conn, 76, 30);
-    lv_obj_align(btn_conn, LV_ALIGN_TOP_LEFT, 124, 4);
+    lv_obj_set_size(btn_conn, 86, 32);
+    lv_obj_align(btn_conn, LV_ALIGN_TOP_LEFT, 68, 5);
     lv_obj_set_style_bg_color(btn_conn, lv_color_hex(0x16A34A), 0);
     lv_obj_add_event_cb(btn_conn, [](lv_event_t * e) {
-        saveAndConnectWiFiFromUI();
+        saveAndConnectWifiFromUI();
     }, LV_EVENT_CLICKED, NULL);
     lv_obj_t * lbl_conn = lv_label_create(btn_conn);
     lv_label_set_text(lbl_conn, "PRIPOJIT");
     lv_obj_center(lbl_conn);
 
     dd_ssid = lv_dropdown_create(current_screen);
-    if (strlen(current_ssid) > 0) {
-        lv_dropdown_set_options(dd_ssid, current_ssid);
-    } else {
-        lv_dropdown_set_options(dd_ssid, "Hledam site...\nProsim cekejte");
-    }
-    lv_obj_set_width(dd_ssid, 152);
-    lv_obj_align(dd_ssid, LV_ALIGN_TOP_LEFT, 4, 40);
+    lv_dropdown_set_options(dd_ssid, "Hledam site...\nProsim cekejte");
+    lv_obj_set_width(dd_ssid, 150);
+    lv_obj_align(dd_ssid, LV_ALIGN_TOP_LEFT, 5, 42);
 
     ta_pass = lv_textarea_create(current_screen);
     lv_textarea_set_one_line(ta_pass, true);
-    lv_textarea_set_password_mode(ta_pass, true); 
-    lv_obj_set_width(ta_pass, 152);
-    lv_obj_align(ta_pass, LV_ALIGN_TOP_RIGHT, -4, 40);
+    lv_textarea_set_password_mode(ta_pass, false); // Heslo je viditelné při psaní na malém displeji
+    lv_obj_set_width(ta_pass, 150);
+    lv_obj_align(ta_pass, LV_ALIGN_TOP_RIGHT, -5, 42);
     lv_textarea_set_text(ta_pass, current_pass);
-    lv_textarea_set_placeholder_text(ta_pass, "Heslo...");
+    lv_textarea_set_placeholder_text(ta_pass, "Heslo Wi-Fi...");
     lv_obj_add_event_cb(ta_pass, ta_event_cb, LV_EVENT_ALL, NULL);
 
     kb = lv_keyboard_create(current_screen);
@@ -2451,6 +2410,125 @@ void update_hybrid_radar() {
     for (int i = 0; i < 3; i++) {
         if (!targets[i].active) continue;
 
+        // === PRVNÍ VÝSKYT (v sekci PULSE módu) ===
+                    int targetRadius = map(constrain((int)targets[i].dist, 50, maxDistCm), 50, maxDistCm, 9, 4);
+                    uint16_t dotColor = getSpeedColor(abs(targets[i].speed));
+
+                    int slot = -1;
+                    for (int e = 0; e < MAX_ECHOS; e++) {
+                        if (echos[e].active && hypotf(echos[e].x - targets[i].x, echos[e].y - targets[i].y) < 25.0f) {
+                            slot = e; break;
+                        }
+                    }
+                    if (slot == -1) {
+                        int minLife = 999;
+                        for (int e = 0; e < MAX_ECHOS; e++) {
+                            if (!echos[e].active) { slot = e; break; }
+                            if (echos[e].life < minLife) { minLife = echos[e].life; slot = e; }
+                        }
+                    }
+                    if (slot >= 0) {
+                        echos[slot].active = true;
+                        echos[slot].x = targets[i].x;
+                        echos[slot].y = max((int)targets[i].y, 48 + targetRadius);
+                        echos[slot].r = targetRadius;
+                        echos[slot].dist = targets[i].dist;
+                        echos[slot].baseColor = dotColor;
+                        echos[slot].life = 255;
+                    }
+                }
+            }
+        }
+
+        int activeEchoCount = 0;
+        for (int e = 0; e < MAX_ECHOS; e++) {
+            if (echos[e].active && echos[e].life > 0) activeEchoCount++;
+        }
+
+        tft.setTextSize(1);
+        tft.setTextColor(SWEEP_COLOR, RADAR_BG);
+        tft.setCursor(4, 46);
+        tft.printf("ODRAZY: %2d ", activeEchoCount);
+
+        if (radar_needs_grid) {
+            drawRawStaticGrid();
+            radar_needs_grid = false;
+        }
+        if (pulseRadius > 0) tft.drawCircle(centerX, centerY, (int)pulseRadius, SWEEP_COLOR);
+
+        for (int e = 0; e < MAX_ECHOS; e++) {
+            if (echos[e].active && echos[e].life > 0) {
+                uint16_t drawColor = tft.alphaBlend(echos[e].life, echos[e].baseColor, RADAR_BG);
+                tft.fillCircle(echos[e].x, echos[e].y, echos[e].r, drawColor);
+                echos[e].lastX = echos[e].x;
+                echos[e].lastY = echos[e].y;
+                echos[e].lastR = echos[e].r;
+                echos[e].life -= 4;
+                if (echos[e].life <= 0) { echos[e].life = 0; echos[e].active = false; }
+            }
+        }
+        return;
+    }
+
+    bool needsGridRedraw = radar_needs_grid;
+    radar_needs_grid = false;
+
+    for (int i = 0; i < 3; i++) {
+        if (targets[i].lastR > 0 || targets[i].lastTrailCount > 0) {
+            eraseTargetVisuals(i);
+            needsGridRedraw = true;
+        }
+        if (targets[i].active && (millis() - targets[i].lastTime >= KEEPALIVE_MS)) {
+            targets[i].active = false; 
+            targets[i].smoothX = 0.0f; 
+            targets[i].smoothWorldY = 0.0f;
+            targets[i].trailCount = 0;
+            if (locked_target_idx == i) {
+                locked_target_idx = -1;
+                tft.fillRect(236, 44, 84, 65, RADAR_BG);
+            }
+            tft.fillRect(0, 44 + (i * 12), 95, 12, RADAR_BG);
+            needsGridRedraw = true;
+        }
+    }
+
+    tft.setTextSize(1);
+    for (int i = 0; i < 3; i++) {
+        if (!targets[i].active) continue;
+        uint16_t dotColor = getSpeedColor(abs(targets[i].speed));
+        tft.setTextColor((locked_target_idx == i) ? LOCK_COLOR : dotColor, RADAR_BG);
+        tft.setCursor(4, 46 + (i * 12));
+        tft.printf("%sC%d:%3dcm %+3.0fd", (locked_target_idx == i) ? ">" : " ", i + 1, (int)targets[i].dist, targets[i].angle_deg);
+        needsGridRedraw = true;
+    }
+
+    if (locked_target_idx >= 0 && targets[locked_target_idx].active) {
+        RadarTarget &lt = targets[locked_target_idx];
+        tft.setTextColor(LOCK_COLOR, RADAR_BG);
+        tft.setCursor(238, 46);
+        tft.printf("LOCK CIL %d  ", locked_target_idx + 1);
+        tft.setTextColor(TFT_WHITE, RADAR_BG);
+        tft.setCursor(238, 58);
+        tft.printf("X:%+5dmm   ", (int)lt.raw_x);
+        tft.setCursor(238, 70);
+        tft.printf("Y:%5dmm   ", (int)lt.raw_y);
+        tft.setCursor(238, 82);
+        tft.printf("V:%+4dcm/s  ", (int)lt.speed);
+        tft.setCursor(238, 94);
+        tft.printf("Res:%3dmm   ", lt.gate_res_mm);
+        needsGridRedraw = true;
+    } else {
+        tft.setTextColor(tft.color565(100, 100, 100), RADAR_BG);
+        tft.setCursor(238, 46);
+        tft.print("Dotyk=LOCK  ");
+    }
+
+    if (needsGridRedraw) drawRawStaticGrid();
+
+    for (int i = 0; i < 3; i++) {
+        if (!targets[i].active) continue;
+
+        // === DRUHÝ VÝSKYT (v sekci LIVE módu) ===
         int targetRadius = map(constrain((int)targets[i].dist, 50, maxDistCm), 50, maxDistCm, 9, 4);
         targets[i].smoothR += (targetRadius - targets[i].smoothR) * SMOOTH_SIZE;
 
@@ -2667,18 +2745,37 @@ void process_remote_commands() {
     else if (cmd == 12) launchApp(APP_AI);
 }
 
+/* === OPRAVENÁ HORNÍ LIŠTA S PŘÍMÝM VÝPISEM LOKÁLNÍ IP ADRESY === */
 void update_status_bar() {
-    if (status_bar_dirty) {
+    static unsigned long last_ip_check = 0;
+    unsigned long now = millis();
+
+    // Každých 500 ms ověříme skutečný stav WiFi.localIP(), aby byla IP vždy vidět
+    if (status_bar_dirty || (now - last_ip_check >= 500)) {
+        last_ip_check = now;
         status_bar_dirty = false;
-        if (wifi_connected) {
+
+        if (WiFi.status() == WL_CONNECTED) {
+            IPAddress lip = WiFi.localIP();
+            if (wg_connected) {
+                snprintf(wifi_ip_str, sizeof(wifi_ip_str), "IP: %d.%d.%d.%d | WG", lip[0], lip[1], lip[2], lip[3]);
+                lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x00FFAA), 0);
+            } else {
+                snprintf(wifi_ip_str, sizeof(wifi_ip_str), "IP: %d.%d.%d.%d", lip[0], lip[1], lip[2], lip[3]);
+                lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x00FF00), 0);
+            }
             lv_label_set_text(wifi_icon, wifi_ip_str);
-            lv_obj_set_style_text_color(wifi_icon, lv_color_hex(wg_connected ? 0x00FFAA : 0x00FF00), 0);
         } else {
-            lv_label_set_text(wifi_icon, wifi_ip_str);
-            lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xAAAAAA), 0);
+            if (strlen(current_ssid) > 0 && activeApp != APP_WIFI) {
+                lv_label_set_text(wifi_icon, "Wi-Fi: Pripojuji...");
+                lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFFAA00), 0);
+            } else {
+                lv_label_set_text(wifi_icon, "Wi-Fi: OFF");
+                lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF5555), 0);
+            }
         }
-        lv_obj_align(wifi_icon, LV_ALIGN_TOP_RIGHT, -6, 6);
-        updateLauncherIpBanner();
+        // Nutné přerovnání po změně délky textu, jinak IP adresa uteče mimo displej!
+        lv_obj_align(wifi_icon, LV_ALIGN_TOP_RIGHT, -6, 8);
     }
 }
 
@@ -2692,6 +2789,9 @@ void setup() {
 
     strokeHistory = (StrokeSegment*)malloc(MAX_STROKES * sizeof(StrokeSegment));
     webDrawQ      = (StrokeSegment*)malloc(WEB_DRAW_Q_SIZE * sizeof(StrokeSegment));
+
+    // Inicializace síťového adaptéru před startem FreeRTOS tasku (nutné pro Core 3.3.11)
+    WiFi.mode(WIFI_STA);
 
     tft.init();
     tft.setRotation(1);
@@ -2728,9 +2828,9 @@ void setup() {
     }
 
     wifi_icon = lv_label_create(lv_layer_top());
-    lv_obj_align(wifi_icon, LV_ALIGN_TOP_RIGHT, -6, 6);
     lv_label_set_text(wifi_icon, "Wi-Fi: OFF");
-    lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF5555), 0);
+    lv_obj_align(wifi_icon, LV_ALIGN_TOP_RIGHT, -6, 8);
 
     toast_box = lv_obj_create(lv_layer_top());
     lv_obj_set_size(toast_box, 280, 34);
@@ -2756,7 +2856,7 @@ void loop() {
     last_lv_tick = now;
 
     if (activeApp == APP_RADAR || activeApp == APP_DOOM) {
-        if (now - last_lv_tick >= 1000 || now - last_fps_calc >= 1000) {
+        if (now - last_fps_calc >= 1000) {
             radar_fps = radar_frame_counter;
             radar_frame_counter = 0;
             last_fps_calc = now;
@@ -2783,10 +2883,33 @@ void loop() {
         }
     }
 
-    if (activeApp == APP_WIFI && wifi_scan_ready) {
-        wifi_scan_ready = false;
-        if (dd_ssid != NULL) {
-            lv_dropdown_set_options(dd_ssid, scan_options_buf);
+    // Automatické uložení vybrané Wi-Fi sítě a hesla i při odchodu tlačítkem ZPET
+    if (activeApp == APP_WIFI) {
+        if (wifi_scan_ready) {
+            wifi_scan_ready = false;
+            if (dd_ssid != NULL) {
+                lv_dropdown_set_options(dd_ssid, scan_options_buf);
+            }
+        }
+        static unsigned long last_wifi_form_sync = 0;
+        if (now - last_wifi_form_sync >= 250 && dd_ssid != NULL && ta_pass != NULL) {
+            last_wifi_form_sync = now;
+            char sel_ssid[64] = "";
+            lv_dropdown_get_selected_str(dd_ssid, sel_ssid, sizeof(sel_ssid));
+            if (strlen(sel_ssid) > 0 &&
+                strcmp(sel_ssid, "Hledam site...") != 0 &&
+                strcmp(sel_ssid, "Prosim cekejte") != 0 &&
+                strcmp(sel_ssid, "Zadne site v okoli") != 0) {
+                const char* typed_pass = lv_textarea_get_text(ta_pass);
+                if (strcmp(current_ssid, sel_ssid) != 0 || strcmp(current_pass, typed_pass) != 0) {
+                    strncpy(current_ssid, sel_ssid, sizeof(current_ssid) - 1);
+                    current_ssid[sizeof(current_ssid) - 1] = '\0';
+                    strncpy(current_pass, typed_pass, sizeof(current_pass) - 1);
+                    current_pass[sizeof(current_pass) - 1] = '\0';
+                    preferences.putString("ssid", String(current_ssid));
+                    preferences.putString("pass", String(current_pass));
+                }
+            }
         }
     }
 
