@@ -24,10 +24,12 @@ const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = ""; 
 
 // Klíče vygenerované příkazem `wg genkey` na Ubuntu:
-const char* WG_PRIVATE_KEY    = "SEM_VLOZ_ESP32_PRIVATE_KEY";
-const char* WG_PUBLIC_KEY     = "SEM_VLOZ_SERVER_PUBLIC_KEY";
+const char* WG_PRIVATE_KEY   = "qNZFRaBrvMINCKnfXp+FC8XJ7sDdM3B5QeS8uTb2Nk8=";
+const char* WG_PUBLIC_KEY    = "Mu6vj1ADSXER7vziNUM5pZ+yQPkBof8Z7XF2a7c62Hg=";
+
+// Veřejná (nebo cílová) IP adresa pro WireGuard UDP tunel (port 51820):
+const char* WG_ENDPOINT_ADDR = "31.30.46.15"; 
 // IP adresa tvého Ubuntu serveru (doma lokální IP např. "192.168.1.50", venku veřejná IP):
-const char* WG_ENDPOINT_ADDR  = "192.168.1.100"; 
 const uint16_t WG_ENDPOINT_PORT = 51820;
 const IPAddress WG_LOCAL_IP(10, 8, 0, 50);
 
